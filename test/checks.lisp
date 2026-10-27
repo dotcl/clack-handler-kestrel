@@ -59,6 +59,19 @@
            (funcall writer (map '(vector (unsigned-byte 8)) #'char-code "two "))
            (sleep 0.1)
            (funcall writer "three" :close t))))
+      ((string= path "/meta")
+       (let ((body (getf env :raw-body)))
+         (list 200 (list :content-type "text/plain")
+               (list (format nil "~a|~a|~a|~a|~a|~a"
+                             (getf env :server-name)
+                             (getf env :content-length)
+                             (getf env :content-type)
+                             (read-byte body nil :eof)
+                             (stream-element-type body)
+                             (getf env :query-string))))))
+      ((string= path "/lines")
+       (list 200 (list :content-type "text/plain")
+             (list (format nil "line 1~%line 2~%") (format nil "line 3~c~%" #\Return))))
       ((string= path "/error") (error "deliberate"))
       (t (list 200 (list :content-type "text/plain") (list "one " "two " "three"))))))
 
@@ -168,6 +181,40 @@
 (let ((r (let ((*error-output* (make-broadcast-stream))) (fetch "/error"))))
   (check "an error in the application is a 500" 500 (status r)))
 
+(check "request without a body"
+       "127.0.0.1|NIL|NIL|EOF|(UNSIGNED-BYTE 8)|NIL"
+       (response-text (fetch "/meta")))
+
+(check "request with a body"
+       "127.0.0.1|3|text/plain; charset=utf-8|97|(UNSIGNED-BYTE 8)|NIL"
+       (response-text (request "POST" "/meta" :body "abc")))
+
+(check "newlines in a response body are kept"
+       (format nil "line 1~%line 2~%line 3~c~%" #\Return)
+       (response-text (fetch "/lines")))
+
+;;; Requests whose bodies have not arrived hold no thread: with many of them
+;;; open, another request is still served at once.
+(defun ascii (string)
+  (dotnet:invoke (dotnet:static "System.Text.Encoding" "ASCII") "GetBytes" string))
+
+(let ((stalled
+        (loop repeat 64
+              collect (let ((client (dotnet:new "System.Net.Sockets.TcpClient" "127.0.0.1" *port*)))
+                        (dotnet:invoke (dotnet:invoke client "GetStream") "Write"
+                                       (ascii (format nil "POST /echo HTTP/1.1~c~cHost: x~c~cContent-Length: 1000~c~c~c~c"
+                                                      #\Return #\Newline #\Return #\Newline
+                                                      #\Return #\Newline #\Return #\Newline)))
+                        client)))
+      (client (dotnet:new "System.Net.Http.HttpClient")))
+  (sleep 1)
+  (setf (dotnet:invoke client "Timeout") (dotnet:static "System.TimeSpan" "FromSeconds" 3d0))
+  (check "served while 64 request bodies are stalled"
+         "one two three"
+         (handler-case (response-text (dotnet:await (dotnet:invoke client "GetAsync" (url "/"))))
+           (error (e) (princ-to-string e))))
+  (mapc (lambda (c) (dotnet:invoke c "Dispose")) stalled))
+
 (check "clack:stop" t (clack:stop *handle*))
 (sleep 1)
 (check "nothing listens after clack:stop" t (refused-p))
@@ -211,6 +258,29 @@
 (check "stop" t (clack.handler.kestrel:stop *server*))
 (check "stop twice" t (clack.handler.kestrel:stop *server*))
 (check "nothing listens after stop" t (refused-p))
+
+;;; Kestrel's limits, set through start.
+
+(setf *server* (clack.handler.kestrel:start #'app :port *port*
+                                            :max-request-body-size 10
+                                            :max-request-headers-total-size 2048
+                                            :request-headers-timeout 5
+                                            :min-request-body-data-rate '(100 3)
+                                            :max-concurrent-connections 100))
+(check "body under max-request-body-size" "short"
+       (response-text (request "POST" "/echo" :body "short")))
+(check "body over max-request-body-size" 413
+       (status (request "POST" "/echo" :body "longer than ten bytes")))
+(check "headers over max-request-headers-total-size" 431
+       (status (request "GET" "/" :headers (list "X-Big" (make-string 4000 :initial-element #\a)))))
+(clack.handler.kestrel:stop *server*)
+
+(setf *server* (clack.handler.kestrel:start #'app :port *port*
+                                            :max-request-body-size nil
+                                            :min-request-body-data-rate nil
+                                            :max-concurrent-connections nil))
+(check "limits removed with NIL" "plain" (response-text (fetch "/string")))
+(clack.handler.kestrel:stop *server*)
 
 (format t "~&~a checks, ~a failed~%" *checks* *failures*)
 (format t "~&~a~%" (if (zerop *failures*) "KESTREL-OK" "KESTREL-FAILED"))
